@@ -38,6 +38,10 @@ label{font-size:13px;color:#44515d;display:block;margin:10px 0 4px}
 .tag.derived{background:#efe6fb;color:#6a3fb5}
 .tag.quar{background:#fdecea;color:#b3261e}
 .tag.affected{background:#fff4e0;color:#9a6a00}
+.tag.active{background:#e8f1ff;color:#1a4fa3}
+.tag.consumed{background:#e6f4ea;color:#1a7f37}
+.tag.cancelled{background:#eceff1;color:#5c6770}
+.tag.expired{background:#f3e9f8;color:#7a4aa0}
 ul.tree{list-style:none;padding-left:18px;border-left:1px dashed #b9c6d0;margin:6px 0}
 ul.tree>li{margin:4px 0}
 .mono{font-family:ui-monospace,Consolas,monospace}
@@ -57,10 +61,11 @@ h4{margin:14px 0 6px;font-size:14px}
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较</p>
+  <p>原瓶登记 / 用量预约（锁定瓶内用量）/ 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
+  <button data-tab="reservations">用量预约</button>
   <button data-tab="register">登记原始瓶</button>
   <button data-tab="operation">新建分装 / 混样</button>
   <button data-tab="batch">批量预演 / 提交</button>
@@ -74,14 +79,48 @@ h4{margin:14px 0 6px;font-size:14px}
 <!-- ============ 瓶子总览 ============ -->
 <section id="tab-bottles">
   <div class="card">
-    <h3>瓶子总览（当前余量）</h3>
+    <h3>瓶子总览（当前余量与可预约量）</h3>
     <table id="bottleTable">
-      <thead><tr><th>瓶编号</th><th>类型</th><th>创建/采样时间</th><th class="num">初始体积 (mL)</th><th class="num">当前余量 (mL)</th><th>来源操作</th><th>隔离状态</th></tr></thead>
+      <thead><tr><th>瓶编号</th><th>类型</th><th>创建/采样时间</th><th class="num">初始体积 (mL)</th><th class="num">当前余量 (mL)</th><th class="num">已预约锁定 (mL)</th><th class="num">可预约量 (mL)</th><th>来源操作</th><th>隔离状态</th></tr></thead>
       <tbody></tbody>
     </table>
-    <p class="hint">点击任意行查看该瓶的完整来源谱系与相关操作。</p>
+    <p class="hint">可预约量 = 当前余量 − 全部有效预约（到期 / 取消 / 核销后自动释放）。点击任意行查看该瓶的完整来源谱系、预约明细与相关操作。</p>
   </div>
   <div class="card" id="bottleDetail" style="display:none"></div>
+</section>
+
+<!-- ============ 用量预约 ============ -->
+<section id="tab-reservations" style="display:none">
+  <div class="card">
+    <h3>申请预约（锁定瓶内用量）</h3>
+    <div class="grid2">
+      <div><label>预约号（唯一；同号同内容重试返回原状态不重复占量，异内容报冲突；终态后不可复用）</label><input id="rv_id" type="text" placeholder="如 RES-0001"></div>
+      <div><label>未来到期时间（到期自动释放锁定且不可兑现）</label><input id="rv_expires" type="datetime-local" step="60"></div>
+    </div>
+    <h4>来源瓶与各自锁定毫升数（正整数；同一预约内来源不得重复）</h4>
+    <div id="rvSources"></div>
+    <p>
+      <button class="btn secondary small" id="rvAddRow">+ 添加来源行</button>
+      <button class="btn" id="rvSubmit">申请预约</button>
+    </p>
+    <p class="hint">可预约量为该瓶当前余量扣除全部有效预约；任一来源超额则整单拒绝且不占号。
+      受隔离影响的瓶不得新预约；隔离解除后未到期预约仍有效。预约可查询、取消；执行分装 / 混样或提交批次时
+      携带预约号且来源与用量逐项吻合即可核销，未携预约的取用只能动用未锁定余量。</p>
+  </div>
+  <div class="card">
+    <h3>各瓶可预约量（余量 − 有效预约）</h3>
+    <table id="availTable">
+      <thead><tr><th>瓶编号</th><th class="num">当前余量 (mL)</th><th class="num">已预约锁定 (mL)</th><th class="num">可预约量 (mL)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>预约记录与状态</h3>
+    <table id="resvTable">
+      <thead><tr><th>预约号</th><th>状态</th><th>到期时间</th><th>锁定内容（瓶 × mL）</th><th>核销 / 取消</th><th>申请时间</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- ============ 登记原始瓶 ============ -->
@@ -105,6 +144,7 @@ h4{margin:14px 0 6px;font-size:14px}
       <div><label>操作号（唯一，重复提交相同内容将幂等返回）</label><input id="op_id" type="text" placeholder="如 OP-0003"></div>
       <div><label>目标瓶编号（须为新编号）</label><input id="op_target" type="text" placeholder="如 MIX-002"></div>
       <div><label>操作时间（不得早于任一来源瓶的创建时间）</label><input id="op_time" type="datetime-local" step="60"></div>
+      <div><label>预约号（可选；携带时来源与用量须与预约逐项吻合，成功后核销；留空则只能动用未锁定余量）</label><input id="op_reservation" type="text" list="activeResvList" placeholder="如 RES-0001（可留空）"></div>
     </div>
     <h4>来源瓶与取用体积（mL，正整数；同一操作内来源不得重复）</h4>
     <div id="opSources"></div>
@@ -130,8 +170,10 @@ h4{margin:14px 0 6px;font-size:14px}
       <button class="btn" id="batchPreview">预演</button>
       <button class="btn" id="batchCommit" style="display:none">提交批次</button>
     </p>
-    <p class="hint">预演不写入数据，返回逐条可行性、受影响瓶预计余量与提交凭据；凭据绑定本次计划与当前台账，
-      预演后若有新登记 / 操作 / 更正 / 批次提交，需重新预演。提交在单个事务中完成：任一条目不合法，整批不落库。</p>
+    <p class="hint">预演不写入数据，返回逐条可行性、受影响瓶预计余量与提交凭据；凭据绑定本次计划、当前台账与预约状态，
+      预演后若有新登记 / 操作 / 更正 / 批次提交 / 隔离变动，或预约变化（申请 / 取消 / 到期 / 核销），需重新预演。
+      每条操作可携带预约号（来源与用量逐项吻合才核销）；未携预约的条目只能使用未锁定余量。
+      提交在单个事务中完成：任一条目不合法，整批不落库、预约不核销。</p>
   </div>
   <div class="card" id="batchResult" style="display:none"></div>
 </section>
@@ -141,7 +183,7 @@ h4{margin:14px 0 6px;font-size:14px}
   <div class="card">
     <h3>操作记录</h3>
     <table id="opTable">
-      <thead><tr><th>操作号</th><th>操作时间</th><th>目标瓶</th><th>来源（瓶 × 体积）</th><th class="num">目标体积 (mL)</th><th>批次</th><th></th></tr></thead>
+      <thead><tr><th>操作号</th><th>操作时间</th><th>目标瓶</th><th>来源（瓶 × 体积）</th><th class="num">目标体积 (mL)</th><th>核销预约</th><th>批次</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -221,6 +263,7 @@ h4{margin:14px 0 6px;font-size:14px}
 
 <datalist id="bottleList"></datalist>
 <datalist id="originalBottleList"></datalist>
+<datalist id="activeResvList"></datalist>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -239,8 +282,21 @@ function showMsg(type, text, details) {
         return `来源瓶 ${c.bottle} 受隔离影响（命中隔离原瓶：` +
           c.hits.map(h => `${h.bottle}（${h.reason}）`).join('、') + '）';
       }
+      if (c && c.reservation_id && c.locked !== undefined) {
+        return `预约 ${c.reservation_id}：瓶 ${c.bottle} 锁定 ${c.locked} mL，当前余量仅 ${c.remaining} mL（超额 ${c.excess} mL）`;
+      }
+      if (c && c.bookable_ml !== undefined) {
+        return `瓶 ${c.bottle}：申请 ${c.requested} mL，当前余量 ${c.remaining} mL、已锁定 ${c.locked_ml} mL、可预约仅 ${c.bookable_ml} mL`;
+      }
+      if (c && c.expected) {
+        const f = arr => (arr || []).map(s => `${s.bottle}×${s.volume}`).join('、');
+        return `预约 ${c.reservation_id} 内容不吻合：应为 [${f(c.expected)}]，实际为 [${f(c.actual)}]`;
+      }
       const where = (c.index !== undefined && c.index !== null) ? `第 ${c.index + 1} 条 ` : '';
-      return `${where}操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL`;
+      if (c && c.op_id && c.bottle && c.requested !== undefined) {
+        return `${where}操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL`;
+      }
+      return JSON.stringify(c);
     }).join('\n');
   }
   el.textContent = html;
@@ -270,9 +326,11 @@ document.querySelectorAll('nav button').forEach(btn => {
     $('tab-' + btn.dataset.tab).style.display = '';
     clearMsg();
     if (btn.dataset.tab === 'bottles') loadBottles();
+    if (btn.dataset.tab === 'reservations') loadReservations();
     if (btn.dataset.tab === 'ops') loadOps();
     if (btn.dataset.tab === 'quarantine') loadQuarantine();
     if (btn.dataset.tab === 'seals') loadSeals();
+    refreshActiveReservations();
   });
 });
 
@@ -304,6 +362,8 @@ async function loadBottles() {
       `<td>${escapeHtml(b.created_time)}</td>` +
       `<td class="num">${b.kind === 'original' ? b.initial_volume : '—'}</td>` +
       `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td>` +
+      `<td class="num${b.locked_ml ? ' low' : ''}">${b.locked_ml}</td>` +
+      `<td class="num">${b.bookable_ml}</td>` +
       `<td class="mono">${escapeHtml(b.created_op || '—')}</td>` +
       `<td>${quarTagHtml(b)}</td>`;
     tr.addEventListener('click', () => showBottle(b.id));
@@ -337,6 +397,14 @@ async function showBottle(id) {
     }
     if (b.affected && b.quarantine_hits && b.quarantine_hits.length) {
       html += `<p class="low">受隔离影响，不得用于新分装 / 混样。命中隔离原瓶：${hitsHtml(b.quarantine_hits)}</p>`;
+    }
+    html += `<p><b>可预约量：${b.bookable_ml} mL</b>（当前余量 ${b.remaining} mL − 有效预约锁定 ${b.locked_ml} mL；未携预约的取用只能动用这部分未锁定余量）</p>`;
+    if (b.reservations && b.reservations.length) {
+      html += '<h4>命中该瓶的有效预约（锁定用量）</h4><table><thead><tr><th>预约号</th><th class="num">锁定 (mL)</th><th>到期时间</th></tr></thead><tbody>';
+      for (const r of b.reservations) {
+        html += `<tr><td class="mono">${escapeHtml(r.reservation_id)}</td><td class="num">${r.volume}</td><td>${escapeHtml(r.expires_at)}</td></tr>`;
+      }
+      html += '</tbody></table>';
     }
     html += `<h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
       <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
@@ -386,6 +454,107 @@ function renderContributions(c) {
   html += `</tbody></table><p class="hint">各项合计：<span class="mono">${fmtFrac(c.sum_ml)}</span>` +
     `（严格等于形成时总体积 ${c.formation_volume} mL，全程精确分数分摊、未逐层舍入）</p>`;
   return html;
+}
+
+// ---------- 用量预约 ----------
+const RESV_STATUS_TEXT = { active: '有效', consumed: '已核销', cancelled: '已取消', expired: '已到期' };
+
+function resvStatusTag(status) {
+  return `<span class="tag ${status}">${RESV_STATUS_TEXT[status] || status}</span>`;
+}
+
+$('rvAddRow').addEventListener('click', () => addSourceRow($('rvSources')));
+
+$('rvSubmit').addEventListener('click', async () => {
+  clearMsg();
+  $('rvSubmit').disabled = true;
+  try {
+    const r = await api('/api/reservations', 'POST', {
+      reservation_id: $('rv_id').value,
+      expires_at: $('rv_expires').value,
+      sources: readSourceRows($('rvSources')),
+    });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等，返回原状态）' : ''));
+    $('rv_id').value = ''; $('rv_expires').value = '';
+    $('rvSources').innerHTML = ''; addSourceRow($('rvSources'));
+    loadReservations(); loadBottles(); refreshActiveReservations();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('rvSubmit').disabled = false;
+  }
+});
+
+async function loadReservations() {
+  const [avail, resvs] = await Promise.all([
+    api('/api/reservations/availability'),
+    api('/api/reservations'),
+  ]);
+  const at = document.querySelector('#availTable tbody');
+  at.innerHTML = '';
+  for (const b of avail.bottles) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="mono">${escapeHtml(b.bottle)}</td>` +
+      `<td class="num">${b.remaining}</td>` +
+      `<td class="num${b.locked_ml ? ' low' : ''}">${b.locked_ml}</td>` +
+      `<td class="num">${b.bookable_ml}</td>`;
+    at.appendChild(tr);
+  }
+  const rt = document.querySelector('#resvTable tbody');
+  rt.innerHTML = '';
+  if (!resvs.length) {
+    rt.innerHTML = '<tr><td colspan="7" class="hint">暂无预约记录。</td></tr>';
+    return;
+  }
+  for (const r of resvs) {
+    const tr = document.createElement('tr');
+    let tail = '—';
+    if (r.status === 'consumed') {
+      tail = `操作 <span class="mono">${escapeHtml(r.consumed_op_id || '—')}</span>` +
+        (r.consumed_batch_id ? `（批次 <span class="mono">${escapeHtml(r.consumed_batch_id)}</span>）` : '');
+    } else if (r.status === 'cancelled') {
+      tail = '取消于 ' + escapeHtml(r.cancelled_at || '');
+    } else if (r.status === 'expired') {
+      tail = '已到期释放';
+    }
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(r.reservation_id)}</td>` +
+      `<td>${resvStatusTag(r.status)}</td>` +
+      `<td>${escapeHtml(r.expires_at)}</td>` +
+      `<td>${r.sources.map(s => `<span class="mono">${escapeHtml(s.bottle)}</span> × ${s.volume} mL`).join('<br>')}</td>` +
+      `<td class="hint">${tail}</td>` +
+      `<td class="hint">${escapeHtml(r.created_at)}</td>` +
+      `<td>${r.status === 'active' ? '<button class="btn secondary small rv-cancel">取消预约</button>' : ''}</td>`;
+    const btn = tr.querySelector('.rv-cancel');
+    if (btn) {
+      btn.addEventListener('click', async () => {
+        clearMsg();
+        try {
+          const x = await api('/api/reservations/' + encodeURIComponent(r.reservation_id), 'DELETE');
+          showMsg('ok', x.message);
+          loadReservations(); loadBottles(); refreshActiveReservations();
+        } catch (e) {
+          showMsg('err', e.message, e.details);
+        }
+      });
+    }
+    rt.appendChild(tr);
+  }
+}
+
+/** 刷新“有效预约”下拉数据（单条操作 / 批次条目选择预约号用）。 */
+async function refreshActiveReservations() {
+  try {
+    const resvs = await api('/api/reservations?status=active');
+    const dl = $('activeResvList');
+    dl.innerHTML = '';
+    for (const r of resvs) {
+      const opt = document.createElement('option');
+      opt.value = r.reservation_id;
+      opt.label = r.sources.map(s => `${s.bottle}×${s.volume}`).join('、') + `（到期 ${r.expires_at}）`;
+      dl.appendChild(opt);
+    }
+  } catch (e) { /* 下拉仅为辅助，失败不阻断页面 */ }
 }
 
 // ---------- 登记原始瓶 ----------
@@ -439,14 +608,15 @@ $('opSubmit').addEventListener('click', async () => {
       op_id: $('op_id').value,
       target_bottle: $('op_target').value,
       op_time: $('op_time').value,
+      reservation_id: $('op_reservation').value,
       sources: readSourceRows($('opSources')),
     });
     showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
     if (!r.idempotent) {
-      $('op_id').value = ''; $('op_target').value = '';
+      $('op_id').value = ''; $('op_target').value = ''; $('op_reservation').value = '';
       $('opSources').innerHTML = ''; addSourceRow($('opSources'));
     }
-    loadBottles();
+    loadBottles(); refreshActiveReservations();
   } catch (e) {
     showMsg('err', e.message, e.details);
   } finally {
@@ -467,6 +637,7 @@ async function loadOps() {
       `<td class="mono">${escapeHtml(o.target_bottle)}</td>` +
       `<td>${o.sources.map(s => `<span class="mono">${escapeHtml(s.bottle)}</span> × ${s.volume} mL`).join('<br>')}</td>` +
       `<td class="num">${o.total}</td>` +
+      `<td class="mono">${o.reservation_id ? escapeHtml(o.reservation_id) : '—'}</td>` +
       `<td class="mono">${o.batch_id ? escapeHtml(o.batch_id) : '—'}</td>` +
       `<td><button class="btn secondary small">更正</button></td>`;
     tr.querySelector('button').addEventListener('click', () => openCorrect(o));
@@ -549,8 +720,8 @@ function renderCorrPreview(r) {
     } else {
       html += '<p class="hint">无原瓶贡献变化。</p>';
     }
-    html += `<p class="hint">确认凭据已签发（绑定本更正计划与台账版本 ${r.ledger_version}）：` +
-      '点击“确认更正”原子应用，结果与预演一致。</p>';
+    html += `<p class="hint">确认凭据已签发（绑定本更正计划、台账版本 ${r.ledger_version} 与预约状态版本 ${r.reservation_version}）：` +
+      '点击“确认更正”原子应用，结果与预演一致。预约变化（含到期）也会使凭据失效，需重新预演。</p>';
   }
   el.innerHTML = html;
 }
@@ -619,6 +790,7 @@ function addBatchItemCard() {
     '<div><label>操作号（唯一）</label><input class="bi-op" type="text" placeholder="如 OP-0101"></div>' +
     '<div><label>目标瓶编号（须为新编号）</label><input class="bi-target" type="text" placeholder="如 MIX-101"></div>' +
     '<div><label>操作时间</label><input class="bi-time" type="datetime-local" step="60"></div>' +
+    '<div><label>预约号（可选；逐项吻合才核销，留空只用未锁定余量）</label><input class="bi-res" type="text" list="activeResvList" placeholder="如 RES-0001（可留空）"></div>' +
     '</div>' +
     '<label>来源瓶与取用体积（mL，正整数；同一操作内来源不得重复）</label>' +
     '<div class="bi-sources"></div>' +
@@ -643,6 +815,7 @@ function readBatchPayload() {
       op_id: div.querySelector('.bi-op').value,
       target_bottle: div.querySelector('.bi-target').value,
       op_time: div.querySelector('.bi-time').value,
+      reservation_id: div.querySelector('.bi-res').value,
       sources: readSourceRows(div.querySelector('.bi-sources')),
     })),
   };
@@ -683,8 +856,9 @@ function renderBatchPreview(r) {
     }
   }
   if (r.commit_token) {
-    html += `<p class="hint">提交凭据已签发（绑定本计划与台账版本 ${r.ledger_version}）：` +
-      `<span class="mono">${escapeHtml(r.commit_token.slice(0, 20))}…</span>　点击“提交批次”完成登记。</p>`;
+    html += `<p class="hint">提交凭据已签发（绑定本计划、台账版本 ${r.ledger_version} 与预约状态版本 ${r.reservation_version}）：` +
+      `<span class="mono">${escapeHtml(r.commit_token.slice(0, 20))}…</span>　点击“提交批次”完成登记。` +
+      '提交前若有登记 / 操作 / 更正 / 隔离变动，或预约变化（申请 / 取消 / 到期 / 核销），需重新预演。</p>';
   }
   el.innerHTML = html;
   el.scrollIntoView({ behavior: 'smooth' });
@@ -728,7 +902,7 @@ $('batchCommit').addEventListener('click', async () => {
     lastPreview = null;
     $('batchItems').innerHTML = ''; addBatchItemCard();
     $('batchResult').style.display = 'none';
-    loadBottles();
+    loadBottles(); refreshActiveReservations();
   } catch (e) {
     showMsg('err', e.message, e.details);
     if (e.code === 'STALE_TOKEN' || e.code === 'PLAN_CHANGED' || e.code === 'BAD_TOKEN') {
@@ -996,7 +1170,9 @@ function renderSealCompare(r) {
 
 // ---------- 启动 ----------
 addSourceRow($('opSources'));
+addSourceRow($('rvSources'));
 addBatchItemCard();
-loadBottles();</script>
+loadBottles();
+refreshActiveReservations();</script>
 </body>
 </html>

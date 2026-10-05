@@ -4,6 +4,10 @@ FROM node:20-bookworm
 
 WORKDIR /app
 
+# 显式指定真实 gcc/g++：个别基础环境的 cc 包装脚本会拦截 node-gyp 的编译参数，
+# 直接指向工具链可保证 better-sqlite3 原生模块顺利编译。
+ENV CC=/usr/bin/gcc CXX=/usr/bin/g++
+
 # 先拷贝依赖清单并安装（利用镜像层缓存）
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
