@@ -3,7 +3,7 @@
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
 原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
 历史操作更正与**更正预演 / 确认两阶段**、**原瓶质检隔离与影响范围拦截**、
-**形成证据封存与复核比较**。
+**形成证据封存与复核比较**、**预约锁定与核销**。
 
 ## 一键启动（Docker Compose）
 
@@ -54,6 +54,10 @@ npm start          # 访问 http://localhost:3000
 - **证据封存**：凭唯一封存号固化指定已登记瓶的形成证据（完整来源谱系、各形成操作的时间与
   取用量、当时余量、精确原瓶贡献、隔离命中），返回封存时间与内容摘要（SHA-256）；
   支持按封存号**查看原样证据**及**与现况比较**（逐项列出新增 / 消失 / 变化，未变化项不列出）。
+- **预约管理**：为待执行的分装 / 混样登记预约（预约号、来源瓶及各自毫升数、未来到期时间），
+  锁定瓶内用量；总览与瓶详情实时展示**预约锁定量与可预约量**（当前余量 − 全部有效预约）；
+  预约列表实时判定状态（有效 / 已到期 / 已取消 / 已核销），有效预约可取消；
+  新建分装 / 混样与批次条目均可携预约号，来源用量逐项吻合即随取用原子核销。
 
 ## 批次处理（本轮新增）
 
@@ -325,6 +329,96 @@ curl -s http://localhost:3000/api/seals
 工作台“证据封存”页支持：新建封存、查看原样证据（谱系树 / 形成操作 / 当时余量 / 精确贡献 /
 隔离命中）、与现况比较（按来源关系、取用量、余量、贡献、隔离命中分组展示差异）。
 
+## 预约锁定与核销（本轮新增）
+
+实验室可为**待执行**的分装 / 混样提前锁定瓶内用量：操作员凭 **预约号 + 来源瓶及各自正整数
+毫升数 + 未来到期时间** 登记预约；执行时单条操作或批次条目携带预约号，来源及用量逐项吻合
+即随取用**原子核销**。
+
+- **可预约量**：`可预约量 = 当前余量 − 全部有效预约`（有效 = 未到期、未取消、未核销）。
+  登记预约时逐瓶校验，超可预约量 → 409 `RESERVE_EXCEEDED`；瓶子总览 / 瓶详情 /
+  `GET /api/bottles` 均展示 `reserved`（锁定量）与 `reservable`（可预约量）。
+- **幂等与编号**：同号同内容（到期时间 + 来源列表一致）重试 → 200 幂等返回**原状态**，
+  不重复占量；同号异内容 → 409 `RESERVATION_CONFLICT`。**到期、取消或核销后编号均不可
+  复用**（同号异内容即冲突）；到期与取消的预约**不可兑现**。
+- **状态**：`active`（有效）/ `expired`（已到期）/ `cancelled`（已取消）/ `fulfilled`
+  （已核销）。到期为惰性实时判定（以服务器本地时间对比到期时间），到期后锁定自动释放回
+  可预约量；取消仅对有效预约可用（重复取消幂等返回），释放锁定量。
+- **携预约执行**：`POST /api/operations` 与批次条目均可带 `reservation_id`。预约须当前有效
+  （不存在 → 400；已到期 → 409 `RESERVATION_EXPIRED`；已取消 / 已核销 → 409
+  `RESERVATION_NOT_ACTIVE`），且**实际来源及用量须与预约逐项吻合**（否则 409
+  `RESERVATION_MISMATCH`）。成功后预约与取用在**同一事务**内核销（操作记录与批次详情
+  均回显 `reservation_id`）；任一环节失败整体回滚，**失败不核销**；**预演只校验**，
+  不核销。同一预约只能核销一次（批内重复携带 → 逐条报错）。
+- **未携预约的取用只能使用未锁定余量**：单条操作超未锁定余量 → 409
+  `UNLOCKED_INSUFFICIENT`；批次按瓶汇总未携预约取用合计，超出即在对应条目报错
+  （预演不签发凭据，提交整批回滚）。携预约条目的取用由其锁定量覆盖，不占用未锁定余量。
+- **更正约束**：更正（立即更正 / 预演 / 确认）若使任一瓶的**有效预约锁定量超过更正后余量**，
+  整次更正拒绝并回滚 → 409 `RESERVATION_EXCEEDED`；更正预演在 `errors` /
+  `reservation_excess` 中给出明细且不签发确认凭据。
+- **隔离联动**：受隔离影响的瓶**不得新预约**（409 `QUARANTINED_SOURCE`）**也不得兑现**
+  （携预约操作的来源即预约来源，被同一拦截规则拦截）；隔离不取消既有预约，
+  **解除后未到期预约仍有效**，可正常兑现。
+- **凭据失效**：批次提交凭据与更正确认凭据除绑定台账版本外，还绑定**预约指纹**
+  （当前有效预约集合的哈希）。预约**新增 / 取消 / 核销 / 到期**都会改变指纹，
+  使未提交的预演凭据失效（409 `STALE_TOKEN`，需重新预演）；**已成功请求的幂等结果
+  保持不变**（批次同内容重试 200 幂等、更正确认同凭据重试返回首次结果、单条操作与
+  预约同内容重试幂等）。预约登记 / 取消不写台账、不递增台账版本，证据封存不受影响。
+
+### 调用示例
+
+```bash
+# 1) 登记预约：锁定 W2026-001 的 300 mL，2026-10-06T09:00 到期 → 201
+curl -s http://localhost:3000/api/reservations -H 'Content-Type: application/json' -d '{
+  "reservation_id": "RSV-0001",
+  "expires_at": "2026-10-06T09:00",
+  "sources": [{"bottle": "W2026-001", "volume": 300}]}'
+# → {"ok":true,"reservation":{"reservation_id":"RSV-0001","status":"active",
+#    "expires_at":"2026-10-06T09:00:00","sources":[{"bottle":"W2026-001","volume":300}], …}}
+#    同号同内容重试 → 200 {"idempotent":true, …原状态…}（不重复占量）
+#    同号异内容 → 409 RESERVATION_CONFLICT（到期 / 取消 / 核销后编号同样不可复用）
+
+# 2) 查看可预约量（当前余量 − 全部有效预约）
+curl -s http://localhost:3000/api/bottles/W2026-001
+# → {"remaining":800,"reserved":300,"reservable":500,
+#    "active_reservations":[{"reservation_id":"RSV-0001","volume":300, …}], …}
+
+# 3) 携预约执行分装：来源及用量与预约逐项吻合，成功后原子核销 → 201
+curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: application/json' -d '{
+  "op_id":"OP-0301","target_bottle":"ALQ-301","op_time":"2026-10-05T09:00",
+  "reservation_id":"RSV-0001",
+  "sources":[{"bottle":"W2026-001","volume":300}]}'
+# → {"ok":true,"message":"操作 OP-0301 已登记，预约 RSV-0001 已随取用原子核销"}
+#    来源用量不吻合 → 409 RESERVATION_MISMATCH；已核销 / 已取消 → 409 RESERVATION_NOT_ACTIVE；
+#    已到期 → 409 RESERVATION_EXPIRED；未携预约而超未锁定余量 → 409 UNLOCKED_INSUFFICIENT
+
+# 4) 批次条目携预约：预演只校验（不核销），提交时随整批原子核销
+curl -s http://localhost:3000/api/batches/preview -H 'Content-Type: application/json' -d '{
+  "batch_id": "BATCH-0002",
+  "items": [
+    {"op_id":"OP-0302","target_bottle":"ALQ-302","op_time":"2026-10-05T10:00",
+     "reservation_id":"RSV-0002",
+     "sources":[{"bottle":"W2026-002","volume":100}]}
+  ]}'
+# → {"ok":true,"commit_token":"v1.<版本>.<预约指纹>.<计划哈希>.<签名>", …}
+curl -s http://localhost:3000/api/batches/commit -H 'Content-Type: application/json' -d '{
+  "batch_id": "BATCH-0002", "items": [ …与预演完全相同的条目… ],
+  "commit_token": "v1.<版本>.<预约指纹>.<计划哈希>.<签名>"}'
+# → 201 {"ok":true,"committed":1,"fulfilled_reservations":["RSV-0002"], …}
+
+# 5) 查询 / 取消预约
+curl -s http://localhost:3000/api/reservations                 # 全部预约（状态实时判定）
+curl -s http://localhost:3000/api/reservations?bottle=W2026-001 # 按瓶过滤
+curl -s http://localhost:3000/api/reservations/RSV-0001         # 单个详情
+curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
+# → 200 {"ok":true,"message":"预约 RSV-0003 已取消，锁定用量已释放回可预约量；该编号不可复用"}
+#    重复取消 → 200 幂等；已核销 → 409 RESERVATION_NOT_ACTIVE；已到期 → 409 RESERVATION_EXPIRED
+```
+
+工作台“预约管理”页支持：登记预约（来源行动态添加）、查看全部预约及实时状态、取消有效预约；
+“瓶子总览”新增 预约锁定 / 可预约 两列，瓶详情展示有效预约明细；“新建分装 / 混样”与
+“批量预演 / 提交”的每条操作均可选填预约号（ datalist 自动列出当前有效预约）。
+
 ## 业务规则与一致性设计
 
 - **唯一操作号 + 幂等**：`op_id` 为主键。同一操作号重复提交**相同内容**时幂等返回
@@ -357,10 +451,20 @@ curl -s http://localhost:3000/api/seals
   同号异目标 409；目标不存在或取证失败时事务回滚、不占号。封存记录无任何更新接口，
   后续分装、更正、隔离变动均不改写；比较接口每次用与封存相同的构建器从当前台账重算，
   逐项对照来源关系 / 取用量 / 余量 / 贡献 / 隔离命中，未变化项不列出。
+- **预约锁定**：预约存于 `reservations` / `reservation_sources` 表（预约号主键、内容哈希、
+  状态、到期时间；到期为查询时惰性判定）。不变量：任一瓶 有效预约锁定量 ≤ 当前余量，
+  登记预约（超可预约量拒绝）、未携预约取用（超未锁定余量拒绝）、更正（使有效预约超额
+  整体回滚）三处共同维护；携预约取用与核销同事务完成，核销释放的锁定与取用等量，
+  不破坏不变量。执行过预约核销的操作在 `operations.reservation_id` 留痕。批次提交 /
+  更正确认凭据绑定预约指纹（有效预约集合哈希），预约新增 / 取消 / 核销 / 到期均使
+  未提交凭据失效；幂等判定（批次号 + 计划哈希、确认凭据哈希、操作号 + 内容、
+  预约号 + 内容哈希）先于凭据校验，已成功请求的重试不受指纹变化影响。
 - **并发守恒**：better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
   并发争用同一来源瓶时不会出现超扣；已用并发压测验证（10 并发争用 400 mL，
   恰好 4 笔成功、余量归零不为负；5 并发重复提交同一操作号仅扣量一次；
-  5 并发重复提交同一批次仅扣量一次，其余幂等返回）。
+  5 并发重复提交同一批次仅扣量一次，其余幂等返回；10 并发争用 400 mL 可预约量
+  恰好 4 笔预约成功、锁定 400 不超额；5 并发重复登记同一预约号仅锁定一次，
+  其余幂等返回；5 并发携同一预约执行仅核销一次）。
 - **明确报错**：编号冲突（409）、来源不存在（400）、操作时间早于来源创建时间（400）、
   体积非正整数（400）、超用（409）等均以 JSON `error.code / message / details` 返回，
   页面顶部同步展示。
@@ -370,16 +474,20 @@ curl -s http://localhost:3000/api/seals
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/bottles` | 登记原始瓶 `{bottle_id, sample_time, initial_volume}` |
-| `POST` | `/api/operations` | 新建操作 `{op_id, target_bottle, op_time, sources:[{bottle, volume}]}` |
-| `POST` | `/api/operations/:op_id/correct` | 更正取用量 `{sources:[{bottle, volume}]}` |
-| `POST` | `/api/operations/:op_id/corrections/preview` | **（新增）** 更正预演（不写库）`{sources}` → 余量变化 `balance_changes` + 目标瓶及下游瓶贡献前后对照 `contribution_changes` + `confirm_token`；校验失败给出原因且不签发凭据 |
-| `POST` | `/api/operations/:op_id/corrections/confirm` | **（新增）** 更正确认（单事务）`{sources, confirm_token}` → 201 / 同一凭据重试幂等 200 / 冲突 409（`PLAN_CHANGED` / `STALE_TOKEN`） |
-| `POST` | `/api/batches/preview` | 批次预演（不写库）`{batch_id, items:[{op_id, target_bottle, op_time, sources}]}` → 逐条可行性 + 预计余量 + 可行条目目标瓶的预计原瓶贡献 `projected_contributions` + `commit_token` |
-| `POST` | `/api/batches/commit` | 批次提交（单事务）`{batch_id, items, commit_token}` → 201 / 幂等 200 / 冲突 409 |
+| `POST` | `/api/operations` | 新建操作 `{op_id, target_bottle, op_time, sources:[{bottle, volume}], reservation_id?}`；携预约号时来源用量须与预约逐项吻合，成功后原子核销 |
+| `POST` | `/api/operations/:op_id/correct` | 更正取用量 `{sources:[{bottle, volume}]}`；使有效预约超额则整体拒绝（409 `RESERVATION_EXCEEDED`） |
+| `POST` | `/api/operations/:op_id/corrections/preview` | 更正预演（不写库）`{sources}` → 余量变化 `balance_changes` + 目标瓶及下游瓶贡献前后对照 `contribution_changes` + 预约超额 `reservation_excess` + `confirm_token`；校验失败给出原因且不签发凭据 |
+| `POST` | `/api/operations/:op_id/corrections/confirm` | 更正确认（单事务）`{sources, confirm_token}` → 201 / 同一凭据重试幂等 200 / 冲突 409（`PLAN_CHANGED` / `STALE_TOKEN` / `RESERVATION_EXCEEDED`） |
+| `POST` | `/api/batches/preview` | 批次预演（不写库）`{batch_id, items:[{op_id, target_bottle, op_time, reservation_id?, sources}]}` → 逐条可行性（含预约校验）+ 预计余量 + 可行条目目标瓶的预计原瓶贡献 `projected_contributions` + `commit_token` |
+| `POST` | `/api/batches/commit` | 批次提交（单事务）`{batch_id, items, commit_token}` → 201（携预约条目随整批原子核销）/ 幂等 200 / 冲突 409 |
 | `GET`  | `/api/batches` | 全部已提交批次 |
-| `GET`  | `/api/batches/:batch_id` | 批次详情（按录入顺序的条目及来源） |
-| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `quarantine` / `affected` / `quarantine_hits` 隔离字段） |
-| `GET` | `/api/bottles/:id` | 单瓶详情：余量、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中 |
+| `GET`  | `/api/batches/:batch_id` | 批次详情（按录入顺序的条目及来源，含各条目核销的 `reservation_id`） |
+| `POST` | `/api/reservations` | **（新增）** 登记预约 `{reservation_id, expires_at, sources:[{bottle, volume}]}` → 201；同号同内容 200 幂等返回原状态；异内容 409 `RESERVATION_CONFLICT`；超可预约量 409 `RESERVE_EXCEEDED`；隔离瓶 409 `QUARANTINED_SOURCE` |
+| `GET`  | `/api/reservations` | **（新增）** 全部预约（状态实时判定：有效 / 已到期 / 已取消 / 已核销）；可按 `?bottle=` 过滤 |
+| `GET`  | `/api/reservations/:id` | **（新增）** 单个预约详情；不存在 404 `RESERVATION_NOT_FOUND` |
+| `POST` | `/api/reservations/:id/cancel` | **（新增）** 取消有效预约 → 200；重复取消 200 幂等；已核销 409 `RESERVATION_NOT_ACTIVE`；已到期 409 `RESERVATION_EXPIRED` |
+| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `reserved` 预约锁定量 / `reservable` 可预约量 / `quarantine` / `affected` / `quarantine_hits`） |
+| `GET` | `/api/bottles/:id` | 单瓶详情：余量、预约锁定与可预约量、有效预约 `active_reservations`、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中 |
 | `PUT` | `/api/bottles/:id/quarantine` | **（新增）** 设置原瓶隔离 `{reason}`（非空；仅原瓶）→ 201 / 更新原因 200 / 相同原因 200 幂等；衍生瓶 400、瓶不存在 404 |
 | `DELETE` | `/api/bottles/:id/quarantine` | **（新增）** 解除原瓶隔离 → 200；未隔离 409 `NOT_QUARANTINED` |
 | `GET` | `/api/quarantines` | **（新增）** 当前全部隔离原瓶及原因、设置时间 |
@@ -389,7 +497,7 @@ curl -s http://localhost:3000/api/seals
 | `GET` | `/api/seals/:seal_id` | **（新增）** 按封存号查询原样证据（谱系、形成操作、当时余量、精确贡献、隔离命中），内容永不改写；封存号不存在 404 |
 | `GET` | `/api/seals/:seal_id/compare` | **（新增）** 与现况比较：同一当前台账状态重算目标瓶，逐项列出来源关系 / 取用量 / 余量 / 贡献 / 隔离命中的新增、消失或变化（未变化项不列出） |
 | `GET` | `/api/bottles/:id/contributions` | **（新增）** 各原始瓶对该瓶的精确贡献量：原瓶编号、约分分数 mL、形成时总体积与合计；瓶不存在 404 |
-| `GET` | `/api/operations` | 全部操作记录（含来源明细、目标体积与所属批次号 `batch_id`） |
+| `GET` | `/api/operations` | 全部操作记录（含来源明细、目标体积、所属批次号 `batch_id` 与核销的预约号 `reservation_id`） |
 
 时间格式统一为 `YYYY-MM-DDTHH:MM`（页面用 `datetime-local` 控件），体积单位为毫升（正整数）。
 
@@ -399,6 +507,6 @@ curl -s http://localhost:3000/api/seals
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较
-└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较 + 预约锁定与核销
+└── public/index.html     # 单页工作台（总览（含可预约量）/ 登记 / 操作 / 批量预演提交 / 预约管理 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存）
 ```

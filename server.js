@@ -17,6 +17,16 @@
  *    批内前项受影响时后项引用一并拦截，整批不落库）。历史记录与更正不受影响，
  *    更正成功后影响范围按当前来源关系重算。隔离状态变动使台账版本递增，
  *    未使用的批次提交 / 更正确认凭据失效；已成功提交的相同请求重试沿用原幂等结果。
+ *  - 预约锁定：操作员凭 预约号 + 来源瓶及各自正整数毫升数 + 未来到期时间 登记预约，
+ *    为待执行的分装 / 混样锁定瓶内用量；可预约量 = 当前余量 − 全部有效预约
+ *    （有效 = 未到期、未取消、未核销）。同号同内容重试幂等返回原状态、不重复占量，
+ *    异内容 409；到期、取消或核销后编号不可复用，到期与取消的预约不可兑现。
+ *    单条操作与批次条目可携预约号，实际来源及用量须与预约逐项吻合，
+ *    成功后与取用原子核销（同事务），失败不核销，预演只校验不核销；
+ *    未携预约的取用只能使用未锁定余量；更正若使有效预约超额则整体拒绝。
+ *    受隔离影响的瓶不得新预约或兑现，解除后未到期预约仍有效。
+ *    预约变化（新增 / 取消 / 核销）或到期使绑定预约指纹的未提交预演凭据失效；
+ *    已成功请求的幂等结果保持不变。
  *  - 证据封存：凭唯一封存号把某个已登记瓶在当前已提交台账状态下的形成证据
  *    （完整来源谱系、各形成操作时间与取用量、当时余量、精确原瓶贡献、隔离命中）
  *    原样固化到 evidence_seals 表并计算 SHA-256 内容摘要。封存只读台账、只写证据表，
@@ -95,11 +105,34 @@ CREATE TABLE IF NOT EXISTS evidence_seals (
   digest         TEXT NOT NULL,                   -- 内容摘要：证据规范化 JSON 的 SHA-256
   evidence       TEXT NOT NULL                    -- 完整证据 JSON（原样保存，永不更新）
 );
+CREATE TABLE IF NOT EXISTS reservations (
+  reservation_id TEXT PRIMARY KEY,
+  plan_hash      TEXT NOT NULL,                   -- 规范化内容哈希（到期时间 + 来源列表），幂等 / 冲突判定
+  status         TEXT NOT NULL CHECK (status IN ('active','cancelled','fulfilled')),
+  expires_at     TEXT NOT NULL,                   -- 到期时间（与操作时间同格式，字典序即时间序）
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  cancelled_at   TEXT,                            -- 取消时刻（仅取消后有值）
+  fulfilled_op   TEXT,                            -- 核销该预约的操作号（仅核销后有值）
+  fulfilled_at   TEXT                             -- 核销时刻（仅核销后有值）
+);
+CREATE TABLE IF NOT EXISTS reservation_sources (
+  reservation_id TEXT NOT NULL REFERENCES reservations(reservation_id) ON DELETE CASCADE,
+  source_bottle  TEXT NOT NULL,
+  volume         INTEGER NOT NULL CHECK (volume > 0),
+  PRIMARY KEY (reservation_id, source_bottle)     -- 同一预约内来源瓶不得重复
+);
+CREATE INDEX IF NOT EXISTS idx_res_sources_bottle ON reservation_sources(source_bottle);
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 `);
+// 迁移：既有数据库的 operations 表补充 reservation_id 列（携预约号执行的操作记录其核销的预约）
+const opCols = db.prepare('PRAGMA table_info(operations)').all().map((c) => c.name);
+if (!opCols.includes('reservation_id')) {
+  db.exec('ALTER TABLE operations ADD COLUMN reservation_id TEXT');
+}
 db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('ledger_version', '0')").run();
 
 // ---------------------------------------------------------------- 工具与校验
@@ -126,6 +159,13 @@ function normTime(v, field) {
   }
   const t = v.trim();
   return t.length === 16 ? t + ':00' : t; // 统一为 YYYY-MM-DDTHH:MM:SS，字典序即时间序
+}
+
+/** 服务器本地当前时刻，格式与操作时间一致（YYYY-MM-DDTHH:MM:SS），用于预约到期判定。 */
+function nowLocal() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 function normVolume(v, field) {
@@ -155,7 +195,7 @@ function parseSources(raw) {
 const qBottle     = db.prepare('SELECT * FROM bottles WHERE id = ?');
 const qInsBottle  = db.prepare('INSERT INTO bottles (id, kind, created_time, initial_volume, created_op) VALUES (?, ?, ?, ?, ?)');
 const qOp         = db.prepare('SELECT * FROM operations WHERE op_id = ?');
-const qInsOp      = db.prepare('INSERT INTO operations (op_id, seq, target_bottle, op_time) VALUES (?, ?, ?, ?)');
+const qInsOp      = db.prepare('INSERT INTO operations (op_id, seq, target_bottle, op_time, reservation_id) VALUES (?, ?, ?, ?, ?)');
 const qNextSeq    = db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM operations');
 const qOpSources  = db.prepare('SELECT source_bottle, volume FROM operation_sources WHERE op_id = ? ORDER BY source_bottle');
 const qInsSource  = db.prepare('INSERT INTO operation_sources (op_id, source_bottle, volume) VALUES (?, ?, ?)');
@@ -175,6 +215,27 @@ const qQuarDel = db.prepare('DELETE FROM quarantines WHERE bottle_id = ?');
 const qSealGet = db.prepare('SELECT * FROM evidence_seals WHERE seal_id = ?');
 const qSealAll = db.prepare('SELECT * FROM evidence_seals ORDER BY sealed_at, seal_id');
 const qSealIns = db.prepare('INSERT INTO evidence_seals (seal_id, bottle_id, ledger_version, sealed_at, digest, evidence) VALUES (?, ?, ?, ?, ?, ?)');
+const qResGet     = db.prepare('SELECT * FROM reservations WHERE reservation_id = ?');
+const qResAll     = db.prepare('SELECT * FROM reservations ORDER BY created_at, reservation_id');
+const qResIns     = db.prepare("INSERT INTO reservations (reservation_id, plan_hash, status, expires_at, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?)");
+const qResCancel  = db.prepare("UPDATE reservations SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE reservation_id = ?");
+const qResFulfill = db.prepare("UPDATE reservations SET status = 'fulfilled', fulfilled_op = ?, fulfilled_at = ?, updated_at = ? WHERE reservation_id = ?");
+const qResSources = db.prepare('SELECT source_bottle, volume FROM reservation_sources WHERE reservation_id = ? ORDER BY source_bottle');
+const qResInsSrc  = db.prepare('INSERT INTO reservation_sources (reservation_id, source_bottle, volume) VALUES (?, ?, ?)');
+// 各瓶被有效预约（未到期、未取消、未核销）锁定的总量
+const qResLocked  = db.prepare(`
+  SELECT rs.source_bottle AS bottle, SUM(rs.volume) AS locked
+  FROM reservation_sources rs
+  JOIN reservations r ON r.reservation_id = rs.reservation_id
+  WHERE r.status = 'active' AND r.expires_at > ?
+  GROUP BY rs.source_bottle`);
+const qResActiveIds = db.prepare("SELECT reservation_id FROM reservations WHERE status = 'active' AND expires_at > ? ORDER BY reservation_id");
+const qResActiveOnBottle = db.prepare(`
+  SELECT r.reservation_id, r.expires_at, rs.volume
+  FROM reservations r
+  JOIN reservation_sources rs ON rs.reservation_id = r.reservation_id
+  WHERE rs.source_bottle = ? AND r.status = 'active' AND r.expires_at > ?
+  ORDER BY r.expires_at, r.reservation_id`);
 
 /**
  * 台账版本号：任何写操作（登记原瓶 / 单条操作 / 更正 / 批次提交）成功提交后递增。
@@ -283,6 +344,127 @@ function quarantineBlockIfAffected(sources) {
     blocked);
 }
 
+// ---------------------------------------------------------------- 预约锁定
+
+/**
+ * 预约有效状态：存储态为 active / cancelled / fulfilled；
+ * active 且到期时间不晚于当前时刻 → 有效态视为 expired（已到期，惰性判定，不写库）。
+ * 到期、取消、核销后编号均不可复用（预约号为主键，异内容 409）；到期与取消不可兑现。
+ */
+function effectiveStatus(row, now) {
+  if (row.status === 'active' && row.expires_at <= now) return 'expired';
+  return row.status;
+}
+
+const RES_STATUS_TEXT = { active: '有效', expired: '已到期', cancelled: '已取消', fulfilled: '已核销' };
+
+/** 各瓶当前被有效预约锁定的总量：Map<瓶编号, 锁定 mL>。 */
+function activeReservedByBottle(now) {
+  const m = new Map();
+  for (const r of qResLocked.all(now)) m.set(r.bottle, r.locked);
+  return m;
+}
+
+/**
+ * 预约指纹：当前有效预约号集合的 SHA-256。预约新增 / 取消 / 核销 / 到期都会改变该集合，
+ * 批次提交凭据与更正确认凭据绑定签发时的指纹，指纹变化即未提交预演凭据失效。
+ */
+function reservationFingerprint() {
+  const ids = qResActiveIds.all(nowLocal()).map((r) => r.reservation_id);
+  return crypto.createHash('sha256').update(ids.join(',')).digest('hex');
+}
+
+/** 预约记录行 → API JSON（状态为实时判定的有效态）。 */
+function reservationJson(r) {
+  const st = effectiveStatus(r, nowLocal());
+  return {
+    reservation_id: r.reservation_id,
+    status: st,
+    status_text: RES_STATUS_TEXT[st],
+    expires_at: r.expires_at,
+    sources: qResSources.all(r.reservation_id).map((s) => ({ bottle: s.source_bottle, volume: s.volume })),
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    cancelled_at: r.cancelled_at || null,
+    fulfilled_op: r.fulfilled_op || null,
+    fulfilled_at: r.fulfilled_at || null,
+  };
+}
+
+/** 预约内容哈希：绑定到期时间与来源列表（顺序无关），用于同号幂等 / 异内容冲突判定。 */
+function reservationPlanHash(expiresAt, sources) {
+  const canonical = JSON.stringify({
+    expires_at: expiresAt,
+    sources: sources.map((s) => `${s.bottle}=${s.volume}`).sort(),
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/** 取出预约并校验其可兑现（存在且当前有效）；不可兑现时抛出具体原因的 409。 */
+function getFulfillableReservation(id) {
+  const r = qResGet.get(id);
+  if (!r) throw new ApiError(400, 'RESERVATION_NOT_FOUND', `预约号 ${id} 不存在`);
+  const st = effectiveStatus(r, nowLocal());
+  if (st === 'expired') {
+    throw new ApiError(409, 'RESERVATION_EXPIRED', `预约 ${id} 已于 ${r.expires_at} 到期，不可兑现`);
+  }
+  if (st === 'cancelled') {
+    throw new ApiError(409, 'RESERVATION_NOT_ACTIVE', `预约 ${id} 已取消，不可兑现`);
+  }
+  if (st === 'fulfilled') {
+    throw new ApiError(409, 'RESERVATION_NOT_ACTIVE', `预约 ${id} 已核销（由操作 ${r.fulfilled_op}），不可重复兑现`);
+  }
+  return r;
+}
+
+/** 预约来源列表（{bottle, volume} 数组，按瓶编号排序）。 */
+function reservationSources(id) {
+  return qResSources.all(id).map((s) => ({ bottle: s.source_bottle, volume: s.volume }));
+}
+
+/**
+ * 未携预约取用的未锁定余量校验：每瓶 取用量 ≤ 当前余量 − 有效预约锁定量。
+ * 全部满足时返回 null，否则返回 409 ApiError（details 逐瓶给出余量 / 锁定 / 可取用量）。
+ */
+function unlockedShortfall(sources) {
+  const { balances } = recompute();
+  const reserved = activeReservedByBottle(nowLocal());
+  const bad = [];
+  for (const s of sources) {
+    const remaining = balances.get(s.bottle) ?? 0;
+    const locked = reserved.get(s.bottle) ?? 0;
+    const unlocked = remaining - locked;
+    if (s.volume > unlocked) {
+      bad.push({ bottle: s.bottle, requested: s.volume, unlocked, remaining, reserved: locked });
+    }
+  }
+  if (!bad.length) return null;
+  return new ApiError(409, 'UNLOCKED_INSUFFICIENT',
+    `未携预约的取用只能使用未锁定余量：${bad.map((b) => `瓶 ${b.bottle} 当前余量 ${b.remaining} mL、有效预约锁定 ${b.reserved} mL、可取用 ${b.unlocked} mL，本次需取 ${b.requested} mL`).join('；')}`,
+    bad);
+}
+
+/**
+ * 更正后的有效预约超额检查：任一瓶 有效预约锁定量 > 更正后余量 即返回冲突明细数组
+ * （无冲突返回空数组）。调用方在事务内重算余量后调用，非空则整体回滚。
+ */
+function reservationExcess() {
+  const { balances } = recompute();
+  const reserved = activeReservedByBottle(nowLocal());
+  const bad = [];
+  for (const [bottle, locked] of reserved) {
+    const remaining = balances.get(bottle) ?? 0;
+    if (locked > remaining) bad.push({ bottle, reserved: locked, remaining });
+  }
+  return bad.sort((a, b) => (a.bottle < b.bottle ? -1 : a.bottle > b.bottle ? 1 : 0));
+}
+
+/** 在事务内核销预约：与取用操作原子完成；任一环节失败事务回滚，不核销。 */
+function fulfillReservation(id, opId) {
+  const now = new Date().toISOString();
+  qResFulfill.run(opId, now, now, id);
+}
+
 // ---------------------------------------------------------------- 业务事务
 
 function sameSources(a, b) {
@@ -291,7 +473,9 @@ function sameSources(a, b) {
   return key(a) === key(b);
 }
 
-/** 新建分装/混样操作（事务）。重复操作号且内容一致 → 幂等返回；不一致 → 409。 */
+/** 新建分装/混样操作（事务）。重复操作号且内容一致 → 幂等返回；不一致 → 409。
+ *  可携预约号：预约须当前有效、来源及用量与预约逐项吻合，成功后与取用原子核销；
+ *  未携预约时取用只能使用未锁定余量（当前余量 − 有效预约锁定量）。 */
 const createOperation = db.transaction((p) => {
   const existing = qOp.get(p.op_id);
   if (existing) {
@@ -299,6 +483,7 @@ const createOperation = db.transaction((p) => {
     const identical =
       existing.target_bottle === p.target &&
       existing.op_time === p.op_time &&
+      (existing.reservation_id || null) === (p.reservation_id || null) &&
       sameSources(oldSrcs, p.sources);
     if (identical) {
       return { ok: true, idempotent: true, message: `操作号 ${p.op_id} 已提交过相同内容，幂等返回，未重复扣量` };
@@ -317,17 +502,36 @@ const createOperation = db.transaction((p) => {
     }
   }
   const quarBlock = quarantineBlockIfAffected(p.sources);
-  if (quarBlock) throw quarBlock;
-  qInsOp.run(p.op_id, qNextSeq.get().next, p.target, p.op_time);
+  if (quarBlock) throw quarBlock; // 受隔离影响的瓶不得兑现预约（预约来源即操作来源），也不得新取用
+
+  let reservation = null;
+  if (p.reservation_id) {
+    reservation = getFulfillableReservation(p.reservation_id); // 到期 / 取消 / 已核销在此拦截
+    const rSrcs = reservationSources(p.reservation_id);
+    if (!sameSources(rSrcs, p.sources)) {
+      throw new ApiError(409, 'RESERVATION_MISMATCH',
+        `实际来源及用量须与预约 ${p.reservation_id} 逐项吻合（预约：${rSrcs.map((s) => `${s.bottle} × ${s.volume} mL`).join('、')}）`,
+        { expected: rSrcs, actual: p.sources });
+    }
+  } else {
+    const shortfall = unlockedShortfall(p.sources);
+    if (shortfall) throw shortfall;
+  }
+
+  qInsOp.run(p.op_id, qNextSeq.get().next, p.target, p.op_time, p.reservation_id || null);
   qInsBottle.run(p.target, 'derived', p.op_time, 0, p.op_id);
   for (const s of p.sources) qInsSource.run(p.op_id, s.bottle, s.volume);
+  if (reservation) fulfillReservation(p.reservation_id, p.op_id); // 与取用原子核销；失败整体回滚不核销
 
   const { conflicts } = recompute();
   if (conflicts.length) {
     throw new ApiError(409, 'OVERDRAW', '取用量超过来源瓶可用余量，操作已拒绝，数据未变更', conflicts);
   }
   qBumpVersion.run();
-  return { ok: true, idempotent: false, message: `操作 ${p.op_id} 已登记` };
+  return { ok: true, idempotent: false,
+           message: reservation
+             ? `操作 ${p.op_id} 已登记，预约 ${p.reservation_id} 已随取用原子核销`
+             : `操作 ${p.op_id} 已登记` };
 });
 
 /** 更正历史操作的取用量（事务）。导致后续超用 → 整体回滚并返回冲突记录。 */
@@ -349,6 +553,12 @@ const correctOperation = db.transaction((opId, sources) => {
   if (conflicts.length) {
     throw new ApiError(409, 'CORRECTION_REJECTED',
       '更正将导致以下操作超用，整次更正已拒绝，原数据保持不变', conflicts);
+  }
+  const excess = reservationExcess();
+  if (excess.length) {
+    throw new ApiError(409, 'RESERVATION_EXCEEDED',
+      `更正将使有效预约超过瓶内余量，整次更正已拒绝，原数据保持不变：${excess.map((e) => `瓶 ${e.bottle} 有效预约锁定 ${e.reserved} mL、更正后余量仅 ${e.remaining} mL`).join('；')}`,
+      excess);
   }
   qBumpVersion.run();
   return { ok: true, message: `操作 ${opId} 的取用量已更正，相关瓶余量已按操作顺序重算` };
@@ -396,6 +606,83 @@ const liftQuarantine = db.transaction((id) => {
            message: `原瓶 ${id} 已解除隔离；仍命中其他隔离原瓶的瓶保持受影响，影响范围已按当前来源关系重算` };
 });
 
+// ---------------------------------------------------------------- 预约业务事务
+
+/**
+ * 登记预约（事务）：为待执行的分装 / 混样锁定瓶内用量。
+ * 同号同内容（到期时间 + 来源列表一致）→ 幂等返回原状态，不重复占量；
+ * 同号异内容 → 409（到期、取消或核销后编号均不可复用）。
+ * 校验：到期时间须为未来；来源瓶已存在且未受隔离影响（隔离瓶不得新预约）；
+ * 每瓶预约量 ≤ 可预约量（当前余量 − 全部有效预约）。
+ * 预约不写台账、不递增台账版本；批次提交 / 更正确认凭据因绑定预约指纹而随之失效。
+ */
+const createReservation = db.transaction((id, expiresAt, sources) => {
+  const planHash = reservationPlanHash(expiresAt, sources);
+  const existing = qResGet.get(id);
+  if (existing) {
+    if (existing.plan_hash === planHash) {
+      const json = reservationJson(existing);
+      return { ok: true, idempotent: true, reservation: json,
+               message: `预约号 ${id} 已存在且内容一致，幂等返回原状态（当前：${json.status_text}），未重复占量` };
+    }
+    throw new ApiError(409, 'RESERVATION_CONFLICT',
+      `预约号 ${id} 已存在且内容不一致；预约到期、取消或核销后编号均不可复用，请更换预约号`);
+  }
+  const now = nowLocal();
+  if (expiresAt <= now) {
+    throw new ApiError(400, 'BAD_TIME', `到期时间须为未来时间（当前 ${now}）`);
+  }
+  for (const s of sources) {
+    if (!qBottle.get(s.bottle)) throw new ApiError(400, 'SOURCE_NOT_FOUND', `来源瓶 ${s.bottle} 不存在`);
+  }
+  const quarBlock = quarantineBlockIfAffected(sources);
+  if (quarBlock) throw quarBlock; // 受隔离影响的瓶不得新预约
+  const { balances } = recompute();
+  const reserved = activeReservedByBottle(now);
+  const bad = [];
+  for (const s of sources) {
+    const remaining = balances.get(s.bottle) ?? 0;
+    const locked = reserved.get(s.bottle) ?? 0;
+    const reservable = remaining - locked;
+    if (s.volume > reservable) {
+      bad.push({ bottle: s.bottle, requested: s.volume, reservable, remaining, reserved: locked });
+    }
+  }
+  if (bad.length) {
+    throw new ApiError(409, 'RESERVE_EXCEEDED',
+      `预约量超过可预约量（当前余量扣除全部有效预约）：${bad.map((b) => `瓶 ${b.bottle} 当前余量 ${b.remaining} mL、有效预约已锁定 ${b.reserved} mL、可预约 ${b.reservable} mL，本次申请 ${b.requested} mL`).join('；')}`,
+      bad);
+  }
+  const nowIso = new Date().toISOString();
+  qResIns.run(id, planHash, expiresAt, nowIso, nowIso);
+  for (const s of sources) qResInsSrc.run(id, s.bottle, s.volume);
+  return { ok: true, idempotent: false, reservation: reservationJson(qResGet.get(id)),
+           message: `预约 ${id} 已登记：${sources.map((s) => `${s.bottle} × ${s.volume} mL`).join('、')} 已锁定，到期时间 ${expiresAt}；执行分装 / 混样时携此预约号且来源用量逐项吻合即可原子核销` };
+});
+
+/**
+ * 取消预约（事务）：仅当前有效的预约可取消；已取消重复取消 → 幂等返回；
+ * 已核销 → 409；已到期 → 409（已自动失效，无需取消）。取消释放锁定量，编号不可复用。
+ */
+const cancelReservation = db.transaction((id) => {
+  const r = qResGet.get(id);
+  if (!r) throw new ApiError(404, 'RESERVATION_NOT_FOUND', `预约号 ${id} 不存在`);
+  if (r.status === 'cancelled') {
+    return { ok: true, idempotent: true, reservation: reservationJson(r),
+             message: `预约 ${id} 已取消过，幂等返回，未重复变更` };
+  }
+  if (r.status === 'fulfilled') {
+    throw new ApiError(409, 'RESERVATION_NOT_ACTIVE', `预约 ${id} 已核销（由操作 ${r.fulfilled_op}），不可取消`);
+  }
+  if (effectiveStatus(r, nowLocal()) === 'expired') {
+    throw new ApiError(409, 'RESERVATION_EXPIRED', `预约 ${id} 已于 ${r.expires_at} 到期失效，无需取消`);
+  }
+  const nowIso = new Date().toISOString();
+  qResCancel.run(nowIso, nowIso, id);
+  return { ok: true, idempotent: false, reservation: reservationJson(qResGet.get(id)),
+           message: `预约 ${id} 已取消，锁定用量已释放回可预约量；该编号不可复用` };
+});
+
 // ---------------------------------------------------------------- 批次（预演 / 提交）
 
 /** 提交凭据签名密钥：默认进程启动时随机生成，重启后旧凭据自动失效（需重新预演）。 */
@@ -410,11 +697,15 @@ function normalizeBatchItems(rawItems) {
     itemErrors.get(i).push({ code, message });
   };
   rawItems.forEach((raw, i) => {
-    const it = { op_id: null, target: null, op_time: null, sources: [] };
+    const it = { op_id: null, target: null, op_time: null, sources: [], reservation_id: null };
     const n = i + 1;
     try { it.op_id = normId(raw && raw.op_id, `操作号（第 ${n} 条）`); } catch (e) { pushErr(i, e.code, e.message); }
     try { it.target = normId(raw && raw.target_bottle, `目标瓶编号（第 ${n} 条）`); } catch (e) { pushErr(i, e.code, e.message); }
     try { it.op_time = normTime(raw && raw.op_time, `操作时间（第 ${n} 条）`); } catch (e) { pushErr(i, e.code, e.message); }
+    const rid = raw && raw.reservation_id;
+    if (rid !== undefined && rid !== null && String(rid).trim() !== '') {
+      try { it.reservation_id = normId(rid, `预约号（第 ${n} 条）`); } catch (e) { pushErr(i, e.code, e.message); }
+    }
     const rawSrcs = raw && raw.sources;
     if (!Array.isArray(rawSrcs) || rawSrcs.length === 0) {
       pushErr(i, 'NO_SOURCES', `第 ${n} 条操作至少需要一个来源瓶`);
@@ -438,7 +729,9 @@ function normalizeBatchItems(rawItems) {
 /**
  * 批次业务校验（预演与提交共用，提交时在事务内重跑）：
  * 编号冲突（批内 / 现有台账）、来源存在性（可引用批内前项生成的瓶）、
- * 操作时间不得早于来源创建时间、来源瓶不得受隔离影响。
+ * 操作时间不得早于来源创建时间、来源瓶不得受隔离影响、
+ * 携预约条目的预约须当前有效且来源及用量逐项吻合（同一预约批内只能核销一次）、
+ * 未携预约条目的取用合计不得超过各瓶未锁定余量。
  * 隔离影响沿批内传播：前项条目命中隔离来源时，其目标瓶视为受影响，
  * 后续引用该瓶的条目一并拦截（提交时整批回滚，不落库）。返回 Map(index -> errors)。
  */
@@ -450,12 +743,15 @@ function validateBatchItems(items) {
   };
   const opFirst = new Map();     // 批内操作号 -> 首次出现的条目下标
   const targetFirst = new Map(); // 批内目标瓶 -> 生成它的条目下标
+  const resFirst = new Map();    // 批内预约号 -> 首次出现的条目下标
   items.forEach((it, i) => {
     if (it.op_id && !opFirst.has(it.op_id)) opFirst.set(it.op_id, i);
     if (it.target && !targetFirst.has(it.target)) targetFirst.set(it.target, i);
+    if (it.reservation_id && !resFirst.has(it.reservation_id)) resFirst.set(it.reservation_id, i);
   });
   const quarImpact = quarantineImpactMap(); // 当前台账中受隔离影响的瓶（含隔离原瓶自身）
   const batchHit = new Map();               // 批内受影响目标瓶 -> 使其受影响的条目下标
+  const now = nowLocal();
   items.forEach((it, i) => {
     if (!it.op_id || !it.target || !it.op_time || it.sources.length === 0) return; // 格式错误已记录
     const n = i + 1;
@@ -463,6 +759,30 @@ function validateBatchItems(items) {
     if (opFirst.get(it.op_id) !== i) pushErr(i, 'OP_DUP_IN_BATCH', `第 ${n} 条：操作号 ${it.op_id} 与第 ${opFirst.get(it.op_id) + 1} 条重复`);
     if (qBottle.get(it.target)) pushErr(i, 'BOTTLE_CONFLICT', `第 ${n} 条：目标瓶编号 ${it.target} 已存在（编号冲突）`);
     if (targetFirst.get(it.target) !== i) pushErr(i, 'TARGET_DUP_IN_BATCH', `第 ${n} 条：目标瓶 ${it.target} 与第 ${targetFirst.get(it.target) + 1} 条重复`);
+    if (it.reservation_id) {
+      if (resFirst.get(it.reservation_id) !== i) {
+        pushErr(i, 'RESERVATION_DUP_IN_BATCH', `第 ${n} 条：预约号 ${it.reservation_id} 与第 ${resFirst.get(it.reservation_id) + 1} 条重复，同一预约只能核销一次`);
+      }
+      const r = qResGet.get(it.reservation_id);
+      if (!r) {
+        pushErr(i, 'RESERVATION_NOT_FOUND', `第 ${n} 条：预约号 ${it.reservation_id} 不存在`);
+      } else {
+        const st = effectiveStatus(r, now);
+        if (st === 'expired') {
+          pushErr(i, 'RESERVATION_EXPIRED', `第 ${n} 条：预约 ${it.reservation_id} 已于 ${r.expires_at} 到期，不可兑现`);
+        } else if (st === 'cancelled') {
+          pushErr(i, 'RESERVATION_NOT_ACTIVE', `第 ${n} 条：预约 ${it.reservation_id} 已取消，不可兑现`);
+        } else if (st === 'fulfilled') {
+          pushErr(i, 'RESERVATION_NOT_ACTIVE', `第 ${n} 条：预约 ${it.reservation_id} 已核销（由操作 ${r.fulfilled_op}），不可重复兑现`);
+        } else {
+          const rSrcs = reservationSources(it.reservation_id);
+          if (!sameSources(rSrcs, it.sources)) {
+            pushErr(i, 'RESERVATION_MISMATCH',
+              `第 ${n} 条：实际来源及用量须与预约 ${it.reservation_id} 逐项吻合（预约：${rSrcs.map((s) => `${s.bottle} × ${s.volume} mL`).join('、')}）`);
+          }
+        }
+      }
+    }
     let itemHit = false; // 本条目是否命中隔离（命中则其目标瓶在批内视为受影响，向后传播）
     for (const s of it.sources) {
       const b = qBottle.get(s.bottle);
@@ -495,6 +815,34 @@ function validateBatchItems(items) {
     }
     if (itemHit) batchHit.set(it.target, i);
   });
+  // 未携预约条目的取用只能动用未锁定余量：按瓶汇总批内未携预约取用，
+  // 不得超过 当前余量 − 有效预约锁定量（携预约条目的取用由其预约锁定量覆盖，
+  // 核销后锁定同步释放，不占用未锁定余量；批内新生成的瓶无预约锁定，由重放校验）。
+  const { balances } = recompute();
+  const reserved = activeReservedByBottle(now);
+  const draws = new Map(); // 瓶 -> { total, idxs }
+  items.forEach((it, i) => {
+    if (it.reservation_id) return;
+    if (!it.op_id || !it.target || !it.op_time || it.sources.length === 0) return;
+    for (const s of it.sources) {
+      if (!draws.has(s.bottle)) draws.set(s.bottle, { total: 0, idxs: new Set() });
+      const d = draws.get(s.bottle);
+      d.total += s.volume;
+      d.idxs.add(i);
+    }
+  });
+  for (const [bottle, d] of draws) {
+    if (!qBottle.get(bottle)) continue; // 批内新生成的瓶：无预约锁定，余量由模拟重放校验
+    const remaining = balances.get(bottle) ?? 0;
+    const locked = reserved.get(bottle) ?? 0;
+    const unlocked = remaining - locked;
+    if (d.total > unlocked) {
+      for (const i of d.idxs) {
+        pushErr(i, 'UNLOCKED_INSUFFICIENT',
+          `第 ${i + 1} 条：未携预约的取用只能使用未锁定余量——瓶 ${bottle} 当前余量 ${remaining} mL、有效预约锁定 ${locked} mL、可取用 ${unlocked} mL，批内未携预约取用合计 ${d.total} mL`);
+      }
+    }
+  }
   return errMap;
 }
 
@@ -533,22 +881,25 @@ function simulateBatch(items, excludeIdx) {
   return { conflicts, projected };
 }
 
-/** 批次计划的规范化内容哈希：绑定批次号与全部条目，用于凭据与幂等判定。 */
+/** 批次计划的规范化内容哈希：绑定批次号与全部条目（含各自预约号），用于凭据与幂等判定。 */
 function planHashOf(batchId, items) {
   const canonical = JSON.stringify({
     batch_id: batchId,
     items: items.map((it) => ({
       op_id: it.op_id, target_bottle: it.target, op_time: it.op_time,
+      reservation_id: it.reservation_id || null,
       sources: it.sources.map((s) => ({ bottle: s.bottle, volume: s.volume })),
     })),
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-/** 提交凭据：绑定 计划哈希 + 当前台账版本，HMAC 签名防篡改。 */
+/** 提交凭据：绑定 计划哈希 + 当前台账版本 + 预约指纹，HMAC 签名防篡改。
+ *  预演后台账变化或预约状态变化（新增 / 取消 / 核销 / 到期）均使凭据失效。 */
 function signCommitToken(version, planHash) {
-  const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`v1.${version}.${planHash}`).digest('hex');
-  return `v1.${version}.${planHash}.${mac}`;
+  const fp = reservationFingerprint();
+  const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`v1.${version}.${fp}.${planHash}`).digest('hex');
+  return `v1.${version}.${fp}.${planHash}.${mac}`;
 }
 
 function verifyCommitToken(token, planHash) {
@@ -556,11 +907,11 @@ function verifyCommitToken(token, planHash) {
     throw new ApiError(400, 'TOKEN_REQUIRED', '缺少提交凭据 commit_token：请先调用 POST /api/batches/preview 预演');
   }
   const parts = token.split('.');
-  if (parts.length !== 4 || parts[0] !== 'v1') {
+  if (parts.length !== 5 || parts[0] !== 'v1') {
     throw new ApiError(400, 'BAD_TOKEN', '提交凭据格式无效，请重新预演获取');
   }
-  const [, ver, ph, mac] = parts;
-  const expect = crypto.createHmac('sha256', TOKEN_SECRET).update(`v1.${ver}.${ph}`).digest('hex');
+  const [, ver, fp, ph, mac] = parts;
+  const expect = crypto.createHmac('sha256', TOKEN_SECRET).update(`v1.${ver}.${fp}.${ph}`).digest('hex');
   const a = Buffer.from(mac); const b = Buffer.from(expect);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     throw new ApiError(409, 'BAD_TOKEN', '提交凭据无效（可能已过期或被篡改），请重新预演');
@@ -570,6 +921,9 @@ function verifyCommitToken(token, planHash) {
   }
   if (parseInt(ver, 10) !== ledgerVersion()) {
     throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
+  }
+  if (fp !== reservationFingerprint()) {
+    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态已变化（新增 / 取消 / 核销 / 到期），预演结果已失效，请重新预演');
   }
 }
 
@@ -600,10 +954,11 @@ const commitBatch = db.transaction((batchId, items, planHash, token) => {
   }
   qInsBatch.run(batchId, planHash, items.length, new Date().toISOString());
   items.forEach((it, i) => {
-    qInsOp.run(it.op_id, qNextSeq.get().next, it.target, it.op_time);
+    qInsOp.run(it.op_id, qNextSeq.get().next, it.target, it.op_time, it.reservation_id || null);
     qInsBottle.run(it.target, 'derived', it.op_time, 0, it.op_id);
     for (const s of it.sources) qInsSource.run(it.op_id, s.bottle, s.volume);
     qInsBatchItem.run(batchId, i, it.op_id);
+    if (it.reservation_id) fulfillReservation(it.reservation_id, it.op_id); // 与取用原子核销；失败整批回滚不核销
   });
   const { balances, conflicts } = recompute();
   if (conflicts.length) {
@@ -614,10 +969,13 @@ const commitBatch = db.transaction((batchId, items, planHash, token) => {
   qBumpVersion.run();
   const affected = new Set();
   for (const it of items) { affected.add(it.target); for (const s of it.sources) affected.add(s.bottle); }
+  const fulfilled = items.filter((it) => it.reservation_id).map((it) => it.reservation_id);
   return {
     ok: true, idempotent: false, batch_id: batchId, committed: items.length,
+    fulfilled_reservations: fulfilled,
     projected_balances: [...affected].sort().map((id) => ({ bottle: id, remaining: balances.get(id) ?? 0 })),
-    message: `批次 ${batchId} 已提交：${items.length} 条操作已登记，相关瓶余量已重算`,
+    message: `批次 ${batchId} 已提交：${items.length} 条操作已登记，相关瓶余量已重算` +
+      (fulfilled.length ? `；预约 ${fulfilled.join('、')} 已随取用原子核销` : ''),
   };
 });
 
@@ -795,10 +1153,11 @@ function correctionPlanHash(opId, sources) {
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-/** 更正确认凭据：绑定 更正计划哈希 + 当前台账版本，HMAC 签名防篡改（域前缀 c1 与批次凭据 v1 隔离）。 */
+/** 更正确认凭据：绑定 更正计划哈希 + 当前台账版本 + 预约指纹，HMAC 签名防篡改（域前缀 c1 与批次凭据 v1 隔离）。 */
 function signCorrectionToken(version, planHash) {
-  const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${version}.${planHash}`).digest('hex');
-  return `c1.${version}.${planHash}.${mac}`;
+  const fp = reservationFingerprint();
+  const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${version}.${fp}.${planHash}`).digest('hex');
+  return `c1.${version}.${fp}.${planHash}.${mac}`;
 }
 
 function verifyCorrectionToken(token, planHash) {
@@ -806,11 +1165,11 @@ function verifyCorrectionToken(token, planHash) {
     throw new ApiError(400, 'TOKEN_REQUIRED', '缺少确认凭据 confirm_token：请先调用 POST /api/operations/:op_id/corrections/preview 预演');
   }
   const parts = token.split('.');
-  if (parts.length !== 4 || parts[0] !== 'c1') {
+  if (parts.length !== 5 || parts[0] !== 'c1') {
     throw new ApiError(400, 'BAD_TOKEN', '确认凭据格式无效，请重新预演获取');
   }
-  const [, ver, ph, mac] = parts;
-  const expect = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${ver}.${ph}`).digest('hex');
+  const [, ver, fp, ph, mac] = parts;
+  const expect = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${ver}.${fp}.${ph}`).digest('hex');
   const a = Buffer.from(mac); const b = Buffer.from(expect);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     throw new ApiError(409, 'BAD_TOKEN', '确认凭据无效（可能已过期或被篡改），请重新预演');
@@ -820,6 +1179,9 @@ function verifyCorrectionToken(token, planHash) {
   }
   if (parseInt(ver, 10) !== ledgerVersion()) {
     throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
+  }
+  if (fp !== reservationFingerprint()) {
+    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态已变化（新增 / 取消 / 核销 / 到期），预演结果已失效，请重新预演');
   }
 }
 
@@ -865,7 +1227,7 @@ function simulateCorrection(opId, newSources) {
     : o));
   const afterReplay = replayLedger(bottles, afterOps);
   if (afterReplay.conflicts.length) {
-    return { conflicts: afterReplay.conflicts, balance_changes: [], contribution_changes: [] };
+    return { conflicts: afterReplay.conflicts, balance_changes: [], contribution_changes: [], balances_after: afterReplay.balances };
   }
   const balanceChanges = [];
   for (const [id, b] of before) {
@@ -897,7 +1259,7 @@ function simulateCorrection(opId, newSources) {
       });
     }
   }
-  return { conflicts: [], balance_changes: balanceChanges, contribution_changes: contributionChanges };
+  return { conflicts: [], balance_changes: balanceChanges, contribution_changes: contributionChanges, balances_after: afterReplay.balances };
 }
 
 /**
@@ -933,6 +1295,12 @@ const confirmCorrection = db.transaction((opId, sources, token) => {
   const { conflicts } = recompute();
   if (conflicts.length) {
     throw new ApiError(409, 'OVERDRAW', '更正将导致以下操作超用，整次更正已拒绝，原数据保持不变', conflicts);
+  }
+  const excess = reservationExcess();
+  if (excess.length) {
+    throw new ApiError(409, 'RESERVATION_EXCEEDED',
+      `更正将使有效预约超过瓶内余量，整次更正已拒绝，原数据保持不变：${excess.map((e) => `瓶 ${e.bottle} 有效预约锁定 ${e.reserved} mL、更正后余量仅 ${e.remaining} mL`).join('；')}`,
+      excess);
   }
   qBumpVersion.run();
   const response = {
@@ -1210,11 +1578,13 @@ app.post('/api/bottles', wrap((req, res) => {
 }));
 
 app.post('/api/operations', wrap((req, res) => {
+  const rid = req.body.reservation_id;
   const p = {
     op_id: normId(req.body.op_id, '操作号'),
     target: normId(req.body.target_bottle, '目标瓶编号'),
     op_time: normTime(req.body.op_time, '操作时间'),
     sources: parseSources(req.body.sources),
+    reservation_id: (rid === undefined || rid === null || String(rid).trim() === '') ? null : normId(rid, '预约号'),
   };
   const result = createOperation(p);
   res.status(result.idempotent ? 200 : 201).json(result);
@@ -1254,6 +1624,7 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
     });
   }
   let diff = { balance_changes: [], contribution_changes: [] };
+  let resExcess = [];
   if (op && errors.length === 0) {
     for (const s of sources) {
       const b = qBottle.get(s.bottle);
@@ -1271,6 +1642,18 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
           message: `更正将导致操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，该时刻可用仅 ${c.available} mL` });
       }
       if (errors.length === 0) {
+        // 更正不得使任一瓶的有效预约锁定量超过更正后余量，否则整体拒绝
+        const reserved = activeReservedByBottle(nowLocal());
+        for (const [bottle, locked] of reserved) {
+          const remaining = sim.balances_after.get(bottle) ?? 0;
+          if (locked > remaining) {
+            resExcess.push({ bottle, reserved: locked, remaining });
+            errors.push({ code: 'RESERVATION_EXCEEDED',
+              message: `更正将使瓶 ${bottle} 的有效预约锁定 ${locked} mL 超过更正后余量 ${remaining} mL` });
+          }
+        }
+      }
+      if (errors.length === 0) {
         diff = { balance_changes: sim.balance_changes, contribution_changes: sim.contribution_changes };
       }
     }
@@ -1284,11 +1667,12 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
     ledger_version: version,
     errors,
     conflicts,
+    reservation_excess: resExcess,
     balance_changes: diff.balance_changes,
     contribution_changes: diff.contribution_changes,
     confirm_token: ok ? signCorrectionToken(version, correctionPlanHash(opId, sources)) : null,
     message: ok
-      ? `预演通过：更正 ${opId} 将变化 ${diff.balance_changes.length} 个瓶余量、${diff.contribution_changes.length} 个瓶的原瓶贡献；凭据已绑定当前台账（版本 ${version}），确认前若台账变化需重新预演`
+      ? `预演通过：更正 ${opId} 将变化 ${diff.balance_changes.length} 个瓶余量、${diff.contribution_changes.length} 个瓶的原瓶贡献；凭据已绑定当前台账（版本 ${version}）与当前预约状态，确认前若台账或预约变化需重新预演`
       : '预演未通过：请修正下列问题后重新预演（未写入任何数据，未签发确认凭据）',
   });
 }));
@@ -1307,16 +1691,23 @@ app.get('/api/bottles', wrap((req, res) => {
   const { balances } = recompute();
   const impact = quarantineImpactMap();
   const quarMap = new Map(qQuarAll.all().map((q) => [q.bottle_id, q]));
+  const reserved = activeReservedByBottle(nowLocal());
   const rows = db.prepare('SELECT * FROM bottles ORDER BY created_time, id').all()
-    .map((b) => ({
-      ...b,
-      remaining: balances.get(b.id) ?? 0,
-      quarantine: quarMap.has(b.id)
-        ? { reason: quarMap.get(b.id).reason, updated_at: quarMap.get(b.id).updated_at }
-        : null,
-      affected: impact.has(b.id),
-      quarantine_hits: impact.get(b.id) || [],
-    }));
+    .map((b) => {
+      const remaining = balances.get(b.id) ?? 0;
+      const locked = reserved.get(b.id) ?? 0;
+      return {
+        ...b,
+        remaining,
+        reserved: locked,              // 有效预约锁定量（未到期、未取消、未核销）
+        reservable: remaining - locked, // 可预约量 = 当前余量 − 全部有效预约
+        quarantine: quarMap.has(b.id)
+          ? { reason: quarMap.get(b.id).reason, updated_at: quarMap.get(b.id).updated_at }
+          : null,
+        affected: impact.has(b.id),
+        quarantine_hits: impact.get(b.id) || [],
+      };
+    });
   res.json(rows);
 }));
 
@@ -1326,9 +1717,15 @@ app.get('/api/bottles/:id', wrap((req, res) => {
   const { balances } = recompute();
   const impact = quarantineImpactMap();
   const quar = qQuarGet.get(b.id);
+  const now = nowLocal();
+  const remaining = balances.get(b.id) ?? 0;
+  const locked = activeReservedByBottle(now).get(b.id) ?? 0;
   res.json({
     ...b,
-    remaining: balances.get(b.id) ?? 0,
+    remaining,
+    reserved: locked,
+    reservable: remaining - locked,
+    active_reservations: qResActiveOnBottle.all(b.id, now), // 当前有效预约（锁定该瓶的预约号、到期时间、锁定量）
     quarantine: quar ? { reason: quar.reason, updated_at: quar.updated_at } : null,
     affected: impact.has(b.id),
     quarantine_hits: impact.get(b.id) || [],
@@ -1393,6 +1790,49 @@ app.get('/api/quarantines/impact', wrap((req, res) => {
         hits,
       })),
   });
+}));
+
+// ---------------------------------------------------------------- 预约 HTTP 接口
+
+/**
+ * 登记预约：{reservation_id, expires_at, sources:[{bottle, volume}]}。
+ * 为待执行的分装 / 混样锁定瓶内用量；可预约量 = 当前余量 − 全部有效预约。
+ * 同号同内容重试 → 200 幂等返回原状态、不重复占量；异内容 → 409 RESERVATION_CONFLICT
+ * （到期、取消或核销后编号均不可复用）。到期时间须为未来；来源瓶须已存在且未受隔离影响；
+ * 超可预约量 → 409 RESERVE_EXCEEDED。成功 → 201。
+ */
+app.post('/api/reservations', wrap((req, res) => {
+  const id = normId(req.body && req.body.reservation_id, '预约号');
+  const expiresAt = normTime(req.body && req.body.expires_at, '到期时间');
+  const sources = parseSources(req.body && req.body.sources);
+  const result = createReservation(id, expiresAt, sources);
+  res.status(result.idempotent ? 200 : 201).json(result);
+}));
+
+/** 全部预约（状态实时判定：有效 / 已到期 / 已取消 / 已核销）。可按 ?bottle= 过滤涉及某瓶的预约。 */
+app.get('/api/reservations', wrap((req, res) => {
+  const bottle = req.query.bottle ? String(req.query.bottle).trim() : null;
+  let rows = qResAll.all();
+  if (bottle) {
+    rows = rows.filter((r) => qResSources.all(r.reservation_id).some((s) => s.source_bottle === bottle));
+  }
+  res.json(rows.map(reservationJson));
+}));
+
+/** 单个预约详情；不存在 → 404 RESERVATION_NOT_FOUND。 */
+app.get('/api/reservations/:id', wrap((req, res) => {
+  const r = qResGet.get(req.params.id);
+  if (!r) throw new ApiError(404, 'RESERVATION_NOT_FOUND', `预约号 ${req.params.id} 不存在`);
+  res.json(reservationJson(r));
+}));
+
+/**
+ * 取消预约：仅当前有效的预约可取消 → 200；重复取消 → 200 幂等返回；
+ * 已核销 → 409 RESERVATION_NOT_ACTIVE；已到期 → 409 RESERVATION_EXPIRED；
+ * 不存在 → 404。取消释放锁定量，编号不可复用。
+ */
+app.post('/api/reservations/:id/cancel', wrap((req, res) => {
+  res.json(cancelReservation(normId(req.params.id, '预约号')));
 }));
 
 app.get('/api/operations', wrap((req, res) => {
@@ -1560,7 +2000,7 @@ app.post('/api/batches/preview', wrap((req, res) => {
     projected_contributions: projectedContributions,
     commit_token: ok ? signCommitToken(version, planHash) : null,
     message: ok
-      ? `预演通过：批次 ${batchId} 共 ${items.length} 条操作可提交；凭据已绑定当前台账（版本 ${version}），提交前若台账变化需重新预演`
+      ? `预演通过：批次 ${batchId} 共 ${items.length} 条操作可提交；凭据已绑定当前台账（版本 ${version}）与当前预约状态，提交前若台账或预约变化需重新预演`
       : '预演未通过：请修正下列问题后重新预演（未写入任何数据）',
   });
 }));
@@ -1591,11 +2031,12 @@ app.get('/api/batches/:batchId', wrap((req, res) => {
   const b = qBatch.get(req.params.batchId);
   if (!b) throw new ApiError(404, 'BATCH_NOT_FOUND', `批次 ${req.params.batchId} 不存在`);
   const items = db.prepare(`
-    SELECT bi.idx, o.op_id, o.target_bottle, o.op_time
+    SELECT bi.idx, o.op_id, o.target_bottle, o.op_time, o.reservation_id
     FROM batch_items bi JOIN operations o ON o.op_id = bi.op_id
     WHERE bi.batch_id = ? ORDER BY bi.idx`).all(b.batch_id)
     .map((r) => ({
       index: r.idx, op_id: r.op_id, target_bottle: r.target_bottle, op_time: r.op_time,
+      reservation_id: r.reservation_id || null,
       sources: qOpSources.all(r.op_id).map((s) => ({ bottle: s.source_bottle, volume: s.volume })),
     }));
   res.json({ ...b, items });
@@ -1610,12 +2051,12 @@ function seed() {
     qInsBottle.run('W2026-002', 'original', '2026-09-30T09:00:00', 800, null);
     qInsBottle.run('W2026-003', 'original', '2026-10-01T08:30:00', 500, null);
 
-    qInsOp.run('OP-0001', 1, 'MIX-001', '2026-10-01T10:00:00');
+    qInsOp.run('OP-0001', 1, 'MIX-001', '2026-10-01T10:00:00', null);
     qInsBottle.run('MIX-001', 'derived', '2026-10-01T10:00:00', 0, 'OP-0001');
     qInsSource.run('OP-0001', 'W2026-001', 200);
     qInsSource.run('OP-0001', 'W2026-002', 150);
 
-    qInsOp.run('OP-0002', 2, 'ALQ-001', '2026-10-02T09:00:00');
+    qInsOp.run('OP-0002', 2, 'ALQ-001', '2026-10-02T09:00:00', null);
     qInsBottle.run('ALQ-001', 'derived', '2026-10-02T09:00:00', 0, 'OP-0002');
     qInsSource.run('OP-0002', 'MIX-001', 100);
 
